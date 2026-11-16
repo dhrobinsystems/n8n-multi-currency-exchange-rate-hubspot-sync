@@ -52,6 +52,8 @@ Every day at 17:15 UTC, after the ECB publishes its reference rates (around 16:0
 
 ## 2. Architecture
 
+![n8n Multi-Currency Exchange Rate HubSpot Sync Workflow Overview](https://raw.githubusercontent.com/dhrobinsystems/n8n-multi-currency-exchange-rate-hubspot-sync/main/workflow-overview.png)
+
 ```mermaid
 flowchart TD
     T[Daily Schedule Trigger<br/>17:15 UTC] --> C[Build Run Context<br/>config · fails closed]
