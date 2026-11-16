@@ -1,0 +1,1119 @@
+{
+  "name": "n8n-multi-currency-exchange-rate-hubspot-sync",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "15 17 * * *"
+            }
+          ]
+        }
+      },
+      "id": "36d5eb57-9b58-52b6-a767-ddc0113f366c",
+      "name": "Daily Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Daily 17:15 UTC — after the ECB publishes (~16:00 CET). Pinned fictional rates and deals for sandbox runs."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Run Context                     Mode: Run Once for All Items\n// Repo: n8n-multi-currency-exchange-rate-hubspot-sync · dhRobin Systems\n// Reads and validates configuration once. Fails closed: an unset or\n// placeholder BASE_CURRENCY outside sandbox stops the run before any call.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst isPlaceholder = (v) => /^YOUR_[A-Z0-9_]*$/i.test(String(v || '').trim());\nconst real = (key, fallback = '') => { const v = env(key, ''); return v === '' || isPlaceholder(v) ? fallback : v; };\n// ── Exact decimal arithmetic (BigInt) · no floating-point drift ──\nconst RATE_SCALE = 12;                          // internal precision for rates\nconst P10 = (n) => 10n ** BigInt(n);\nconst MINOR_UNITS = { JPY: 0, KRW: 0, VND: 0, CLP: 0, ISK: 0, PYG: 0, UGX: 0, XOF: 0, XAF: 0, XPF: 0, KMF: 0, RWF: 0, VUV: 0, GNF: 0, DJF: 0, BIF: 0,\n  BHD: 3, KWD: 3, OMR: 3, JOD: 3, TND: 3, LYD: 3, IQD: 3, CLF: 4, UYW: 4 };\nconst minorUnits = (cur) => (MINOR_UNITS[cur] === undefined ? 2 : MINOR_UNITS[cur]);\nconst isIso = (c) => /^[A-Z]{3}$/.test(String(c || ''));\n// \"1234.5678\" → { v: 12345678n, s: 4 }  (rejects exponents, thousands separators, garbage)\nconst parseDec = (input) => {\n  let str = typeof input === 'number' ? (!Number.isFinite(input) ? '' : /e/i.test(String(input)) ? input.toFixed(12) : String(input)) : String(input ?? '').trim();\n  if (!/^-?\\d+(\\.\\d+)?$/.test(str)) return null;\n  const neg = str.startsWith('-'); if (neg) str = str.slice(1);\n  const [i, f = ''] = str.split('.');\n  const frac = f.slice(0, 18);\n  const v = BigInt(i + frac) * (neg ? -1n : 1n);\n  return { v, s: frac.length };\n};\n// rounding a BigInt division num/den (den > 0) with mode half_up | half_even | down\nconst divRound = (num, den, mode) => {\n  const neg = num < 0n; const n = neg ? -num : num;\n  let q = n / den; const r = n % den;\n  if (mode !== 'down') {\n    const twice = r * 2n;\n    if (twice > den || (twice === den && (mode === 'half_up' || (mode === 'half_even' && q % 2n === 1n)))) q += 1n;\n  }\n  return neg ? -q : q;\n};\nconst rescale = (d, s, mode) => (s >= d.s ? d.v * P10(s - d.s) : divRound(d.v, P10(d.s - s), mode));\nconst fmt = (v, s) => { const neg = v < 0n; let t = (neg ? -v : v).toString().padStart(s + 1, '0'); const out = s ? `${t.slice(0, -s)}.${t.slice(-s)}` : t; return (neg ? '-' : '') + out; };\nconst trimZeros = (str) => (str.includes('.') ? str.replace(/0+$/, '').replace(/\\.$/, '') : str);\n// cross rate: 1 unit of FROM = (anchorPerTo / anchorPerFrom) units of TO, rounded to `decimals`\nconst crossRate = (perFrom, perTo, decimals, mode) => {\n  const a = parseDec(perFrom); const b = parseDec(perTo);\n  if (!a || !b || a.v <= 0n || b.v <= 0n) return null;\n  // (b / a) at `decimals`\n  return { v: divRound(b.v * P10(a.s) * P10(decimals), a.v * P10(b.s), mode), s: decimals };\n};\nconst multiply = (amount, rate, decimals, mode) => ({ v: divRound(amount.v * rate.v, P10(amount.s + rate.s - decimals), mode), s: decimals });\nconst pctChange = (oldStr, newStr) => { const o = Number(oldStr); const n = Number(newStr); return o > 0 ? Math.abs(n - o) / o * 100 : 0; };\n// ── ECB XML (eurofxref-daily / -hist-90d): <Cube time=\"YYYY-MM-DD\"><Cube currency=\"USD\" rate=\"1.0573\"/>… ──\nconst parseEcbXml = (xml) => {\n  const days = {};\n  const re = /<Cube\\s+time=['\"](\\d{4}-\\d{2}-\\d{2})['\"]\\s*>([\\s\\S]*?)<\\/Cube>/g; let m;\n  while ((m = re.exec(String(xml || '')))) {\n    const rates = { EUR: '1' }; const rr = /<Cube\\s+currency=['\"]([A-Z]{3})['\"]\\s+rate=['\"]([0-9.]+)['\"]\\s*\\/>/g; let x;\n    while ((x = rr.exec(m[2]))) rates[x[1]] = x[2];\n    if (Object.keys(rates).length > 1) days[m[1]] = rates;\n  }\n  return days; // { \"2026-11-16\": { EUR: \"1\", USD: \"1.0573\", … } } — anchor EUR\n};\n// latest available date ≤ target (weekends, TARGET holidays)\nconst dateOnOrBefore = (days, target) => Object.keys(days).filter((d) => d <= target).sort().pop() || null;\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst trig = $input.first() ? $input.first().json : {};\nconst fixtures = SANDBOX_MODE ? (trig.sandboxFixtures || null) : null;\nlet runId; try { runId = 'fx_' + require('crypto').randomUUID(); } catch (e) { runId = 'fx_' + Date.now().toString(36); }\nconst base = real('BASE_CURRENCY', SANDBOX_MODE ? 'USD' : '').toUpperCase();\nconst today = SANDBOX_MODE && fixtures && fixtures.today ? fixtures.today : new Date().toISOString().slice(0, 10);\nconst sourcePolicy = ['ecb', 'oer', 'ecb_then_oer', 'oer_then_ecb'].includes(env('RATE_SOURCE', 'ecb_then_oer').toLowerCase()) ? env('RATE_SOURCE', 'ecb_then_oer').toLowerCase() : 'ecb_then_oer';\nconst rounding = ['half_up', 'half_even'].includes(env('ROUNDING_MODE', 'half_up').toLowerCase()) ? env('ROUNDING_MODE', 'half_up').toLowerCase() : 'half_up';\nconst baseDecimals = env('BASE_AMOUNT_DECIMALS', '') !== '' ? Math.max(0, Math.min(6, num('BASE_AMOUNT_DECIMALS', 2))) : minorUnits(base);\nconst config = {\n  base, today, sourcePolicy, rounding, baseDecimals,\n  companyCurrency: real('HUBSPOT_COMPANY_CURRENCY', base).toUpperCase(),\n  rateDecimals: Math.max(6, Math.min(12, num('RATE_DECIMALS', 10))),\n  maxRateAgeDays: Math.max(0, num('MAX_RATE_AGE_DAYS', 4)),\n  maxDailyChangePct: Math.max(0, num('MAX_DAILY_RATE_CHANGE_PCT', 10)),\n  crossSourceTolerancePct: Math.max(0, num('CROSS_SOURCE_TOLERANCE_PCT', 2)),\n  closedLookbackDays: Math.max(0, num('CLOSED_WON_LOOKBACK_DAYS', 30)),\n  closedPolicy: ['close_date', 'skip'].includes(env('CLOSED_DEAL_POLICY', 'close_date').toLowerCase()) ? env('CLOSED_DEAL_POLICY', 'close_date').toLowerCase() : 'close_date',\n  includeBaseCurrencyDeals: flag('INCLUDE_BASE_CURRENCY_DEALS', true),\n  allowNegative: flag('ALLOW_NEGATIVE_AMOUNTS', false),\n  pipelines: csv('HUBSPOT_PIPELINE_IDS', '').filter((x) => !isPlaceholder(x)),\n  prefix: env('HUBSPOT_FX_PROPERTY_PREFIX', 'fx_'),\n  maxUpdates: Math.max(1, num('MAX_UPDATES_PER_RUN', 5000)),\n  maxDeals: Math.max(1, num('MAX_DEALS_PER_RUN', 20000)),\n};\nconst problems = [];\nif (!isIso(base)) problems.push('base_currency_not_configured');\nif (!isIso(config.companyCurrency)) problems.push('company_currency_invalid');\nconst mode = SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live';\nreturn [{ json: { run: { runId, startedAt: new Date().toISOString(), mode, sandboxMode: SANDBOX_MODE, dryRun: DRY_RUN }, config, fixtures, problems,\n  oerConfigured: !SANDBOX_MODE && !!real('OER_APP_ID', '') && sourcePolicy !== 'ecb' } }];\n"
+      },
+      "id": "1f9995ea-7f57-5385-b5d0-466fe1755cc9",
+      "name": "Build Run Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "Config, base currency, safety switches. Fails closed on a missing base currency."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "845141f9-7ad1-5ad0-81c8-8e7687c93f41",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5547b182-6c7e-5c7f-a41a-a618cb7a3ab8",
+      "name": "Sandbox Rates?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Load Rate Fixtures (Sandbox)          Mode: Run Once for All Items\n// Fictional ECB 90-day XML and Open Exchange Rates JSON from the pinned\n// trigger data, in the same shape the two HTTP Request nodes return.\n// ─────────────────────────────────────────────────────────────────────\nconst fx = $input.first().json.fixtures || {};\nreturn [{ json: { ecbFixture: { statusCode: 200, body: fx.ecbXml || '' }, oerFixture: fx.oerLatest ? { statusCode: 200, body: fx.oerLatest, prev: fx.oerPrevious || null } : null } }];\n"
+      },
+      "id": "ab355aec-31a0-5127-a696-5b55dc38071f",
+      "name": "Load Rate Fixtures (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.ECB_RATES_URL || 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist-90d.xml' }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "c4ab699a-6908-58a3-a28d-1d3b7535b2bd",
+      "name": "Fetch ECB Reference Rates",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        380
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "Free, no key · EUR-based reference rates of the last ~90 working days (newest = spot)."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "680073ce-c6ca-5404-a06b-4ab94206db72",
+              "leftValue": "={{ $('Build Run Context').first().json.oerConfigured }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7288ed83-6f81-527e-ab69-25f887217ff8",
+      "name": "OER Configured?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ ($env.OER_API_BASE_URL || 'https://openexchangerates.org/api').replace(/\\/+$/, '') }}/latest.json",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Token {{ $env.OER_APP_ID }}"
+            }
+          ]
+        }
+      },
+      "id": "0e4aff9c-5411-57d2-bc4f-bccda253b2c2",
+      "name": "Fetch Open Exchange Rates",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        460
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "App ID in the Authorization header (kept out of URLs and logs) · USD-based on the free plan."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Normalize, Validate & Cache Rates     Mode: Run Once for All Items\n// Sources:\n//   ECB  eurofxref-hist-90d.xml · anchor EUR · reference rates of the\n//        last ~90 working days (spot = newest day, history for close dates)\n//   OER  /api/latest.json · anchor USD (free plan) · fills currencies the\n//        ECB does not publish\n// Per currency the policy (RATE_SOURCE) picks ONE source; both currencies of\n// a cross rate always come from the same source and date.\n// Guards: stale rates (MAX_RATE_AGE_DAYS), day-over-day jump\n// (MAX_DAILY_RATE_CHANGE_PCT), ECB vs OER disagreement\n// (CROSS_SOURCE_TOLERANCE_PCT) → that currency is HELD, deals untouched.\n// Cache: last good ECB days + OER snapshot in workflow static data, used\n// when a fetch fails (still subject to the age limit). Not in sandbox.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst isPlaceholder = (v) => /^YOUR_[A-Z0-9_]*$/i.test(String(v || '').trim());\nconst real = (key, fallback = '') => { const v = env(key, ''); return v === '' || isPlaceholder(v) ? fallback : v; };\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'OER_APP_ID', 'SLACK_WEBHOOK_URL'].map((k) => env(k, '')).filter((v) => v.length >= 8 && !isPlaceholder(v));\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|app[-_]?id|cookie|signature|webhook[-_]?url|credential)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/Token\\s+[A-Za-z0-9]{16,}/g, 'Token [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:app_id|api_key|apikey|key|token|access_key)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 200).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') { const out = {}; for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1); return out; }\n  return value;\n};\n// ── Exact decimal arithmetic (BigInt) · no floating-point drift ──\nconst RATE_SCALE = 12;                          // internal precision for rates\nconst P10 = (n) => 10n ** BigInt(n);\nconst MINOR_UNITS = { JPY: 0, KRW: 0, VND: 0, CLP: 0, ISK: 0, PYG: 0, UGX: 0, XOF: 0, XAF: 0, XPF: 0, KMF: 0, RWF: 0, VUV: 0, GNF: 0, DJF: 0, BIF: 0,\n  BHD: 3, KWD: 3, OMR: 3, JOD: 3, TND: 3, LYD: 3, IQD: 3, CLF: 4, UYW: 4 };\nconst minorUnits = (cur) => (MINOR_UNITS[cur] === undefined ? 2 : MINOR_UNITS[cur]);\nconst isIso = (c) => /^[A-Z]{3}$/.test(String(c || ''));\n// \"1234.5678\" → { v: 12345678n, s: 4 }  (rejects exponents, thousands separators, garbage)\nconst parseDec = (input) => {\n  let str = typeof input === 'number' ? (!Number.isFinite(input) ? '' : /e/i.test(String(input)) ? input.toFixed(12) : String(input)) : String(input ?? '').trim();\n  if (!/^-?\\d+(\\.\\d+)?$/.test(str)) return null;\n  const neg = str.startsWith('-'); if (neg) str = str.slice(1);\n  const [i, f = ''] = str.split('.');\n  const frac = f.slice(0, 18);\n  const v = BigInt(i + frac) * (neg ? -1n : 1n);\n  return { v, s: frac.length };\n};\n// rounding a BigInt division num/den (den > 0) with mode half_up | half_even | down\nconst divRound = (num, den, mode) => {\n  const neg = num < 0n; const n = neg ? -num : num;\n  let q = n / den; const r = n % den;\n  if (mode !== 'down') {\n    const twice = r * 2n;\n    if (twice > den || (twice === den && (mode === 'half_up' || (mode === 'half_even' && q % 2n === 1n)))) q += 1n;\n  }\n  return neg ? -q : q;\n};\nconst rescale = (d, s, mode) => (s >= d.s ? d.v * P10(s - d.s) : divRound(d.v, P10(d.s - s), mode));\nconst fmt = (v, s) => { const neg = v < 0n; let t = (neg ? -v : v).toString().padStart(s + 1, '0'); const out = s ? `${t.slice(0, -s)}.${t.slice(-s)}` : t; return (neg ? '-' : '') + out; };\nconst trimZeros = (str) => (str.includes('.') ? str.replace(/0+$/, '').replace(/\\.$/, '') : str);\n// cross rate: 1 unit of FROM = (anchorPerTo / anchorPerFrom) units of TO, rounded to `decimals`\nconst crossRate = (perFrom, perTo, decimals, mode) => {\n  const a = parseDec(perFrom); const b = parseDec(perTo);\n  if (!a || !b || a.v <= 0n || b.v <= 0n) return null;\n  // (b / a) at `decimals`\n  return { v: divRound(b.v * P10(a.s) * P10(decimals), a.v * P10(b.s), mode), s: decimals };\n};\nconst multiply = (amount, rate, decimals, mode) => ({ v: divRound(amount.v * rate.v, P10(amount.s + rate.s - decimals), mode), s: decimals });\nconst pctChange = (oldStr, newStr) => { const o = Number(oldStr); const n = Number(newStr); return o > 0 ? Math.abs(n - o) / o * 100 : 0; };\n// ── ECB XML (eurofxref-daily / -hist-90d): <Cube time=\"YYYY-MM-DD\"><Cube currency=\"USD\" rate=\"1.0573\"/>… ──\nconst parseEcbXml = (xml) => {\n  const days = {};\n  const re = /<Cube\\s+time=['\"](\\d{4}-\\d{2}-\\d{2})['\"]\\s*>([\\s\\S]*?)<\\/Cube>/g; let m;\n  while ((m = re.exec(String(xml || '')))) {\n    const rates = { EUR: '1' }; const rr = /<Cube\\s+currency=['\"]([A-Z]{3})['\"]\\s+rate=['\"]([0-9.]+)['\"]\\s*\\/>/g; let x;\n    while ((x = rr.exec(m[2]))) rates[x[1]] = x[2];\n    if (Object.keys(rates).length > 1) days[m[1]] = rates;\n  }\n  return days; // { \"2026-11-16\": { EUR: \"1\", USD: \"1.0573\", … } } — anchor EUR\n};\n// latest available date ≤ target (weekends, TARGET holidays)\nconst dateOnOrBefore = (days, target) => Object.keys(days).filter((d) => d <= target).sort().pop() || null;\n\nconst ctx = $('Build Run Context').first().json;\nconst { run, config } = ctx;\nconst S = run.sandboxMode;\nconst input = $input.first() ? $input.first().json : {};\nconst tryNode = (name) => { try { return $(name).first().json; } catch (e) { return null; } };\nconst ecbRes = S ? input.ecbFixture : tryNode('Fetch ECB Reference Rates');\nconst oerRes = S ? input.oerFixture : tryNode('Fetch Open Exchange Rates');\nconst warnings = [];\nlet sd = {}; try { sd = S ? {} : $getWorkflowStaticData('global'); } catch (e) { sd = {}; }\nconst cache = S ? {} : (sd.fxRateCache = sd.fxRateCache || {});\nconst daysBetween = (a, b) => Math.round((Date.parse(b + 'T00:00:00Z') - Date.parse(a + 'T00:00:00Z')) / 86400000);\nconst okStatus = (r) => r && Number(r.statusCode || 200) >= 200 && Number(r.statusCode || 200) < 300 && r.body !== undefined;\n\n// ── ECB ──\nlet ecbDays = {};\nif (okStatus(ecbRes)) ecbDays = parseEcbXml(typeof ecbRes.body === 'string' ? ecbRes.body : Buffer.isBuffer(ecbRes.body) ? ecbRes.body.toString('utf8') : String(ecbRes.data || ''));\nif (!Object.keys(ecbDays).length) {\n  warnings.push(ecbRes ? `ecb_fetch_failed:http_${ecbRes.statusCode || 'parse'}` : 'ecb_not_fetched');\n  if (cache.ecbDays) { ecbDays = cache.ecbDays; warnings.push('ecb_from_cache'); }\n} else if (!S) {\n  const merged = { ...(cache.ecbDays || {}), ...ecbDays };\n  const keep = Object.keys(merged).sort().slice(-130);\n  cache.ecbDays = Object.fromEntries(keep.map((d) => [d, merged[d]]));\n  ecbDays = cache.ecbDays;\n}\nconst ecbDates = Object.keys(ecbDays).sort();\nconst ecbLatest = ecbDates[ecbDates.length - 1] || null;\nconst ecbPrev = ecbDates[ecbDates.length - 2] || null;\nconst ecbFresh = !!ecbLatest && daysBetween(ecbLatest, config.today) <= config.maxRateAgeDays;\nif (ecbLatest && !ecbFresh) warnings.push(`ecb_stale:${ecbLatest}`);\n\n// ── Open Exchange Rates ──\nlet oer = null; let oerPrev = cache.oerPrev || null;\nconst body = oerRes && okStatus(oerRes) ? (typeof oerRes.body === 'string' ? (() => { try { return JSON.parse(oerRes.body); } catch (e) { return null; } })() : oerRes.body) : null;\nif (body && body.rates && body.base && body.timestamp) {\n  const rates = {}; for (const [k, v] of Object.entries(body.rates)) { const d = parseDec(v); if (isIso(k) && d && d.v > 0n) rates[k] = fmt(d.v, d.s); }\n  oer = { anchor: String(body.base).toUpperCase(), date: new Date(Number(body.timestamp) * 1000).toISOString().slice(0, 10), rates };\n  if (!S) { if (cache.oer && cache.oer.date !== oer.date) cache.oerPrev = cache.oer; oerPrev = cache.oerPrev || null; cache.oer = oer; }\n} else if (oerRes) {\n  warnings.push(`oer_fetch_failed:http_${oerRes.statusCode || 'parse'}`);\n  if (cache.oer) { oer = cache.oer; warnings.push('oer_from_cache'); }\n}\nif (S && input.oerFixture && input.oerFixture.prev) oerPrev = input.oerFixture.prev;\nconst oerFresh = !!oer && daysBetween(oer.date, config.today) <= config.maxRateAgeDays;\nif (oer && !oerFresh) warnings.push(`oer_stale:${oer.date}`);\n\n// ── choose a source per currency ──\nconst B = config.base;\nconst ecbHas = (c) => ecbFresh && ecbDays[ecbLatest][c] !== undefined && ecbDays[ecbLatest][B] !== undefined;\nconst oerPer = (snap, c) => (c === snap.anchor ? '1' : snap.rates[c]);\nconst oerHas = (c) => oerFresh && oerPer(oer, c) !== undefined && oerPer(oer, B) !== undefined;\nconst order = { ecb: ['ecb'], oer: ['oer'], ecb_then_oer: ['ecb', 'oer'], oer_then_ecb: ['oer', 'ecb'] }[config.sourcePolicy];\nconst currencies = new Set([...(ecbLatest ? Object.keys(ecbDays[ecbLatest]) : []), ...(oer ? Object.keys(oer.rates).concat(oer.anchor) : [])]);\nconst spot = {}; const held = {};\nconst cross = (perFrom, perTo) => crossRate(perFrom, perTo, config.rateDecimals, config.rounding);\nfor (const c of [...currencies].sort()) {\n  if (c === B) continue;\n  const src = order.find((s) => (s === 'ecb' ? ecbHas(c) : oerHas(c)));\n  if (!src) continue;\n  const r = src === 'ecb' ? cross(ecbDays[ecbLatest][c], ecbDays[ecbLatest][B]) : cross(oerPer(oer, c), oerPer(oer, B));\n  if (!r) continue;\n  const entry = { rate: trimZeros(fmt(r.v, r.s)), rateFixed: fmt(r.v, r.s), source: src, date: src === 'ecb' ? ecbLatest : oer.date };\n  // day-over-day guard\n  let prevRate = null;\n  if (src === 'ecb' && ecbPrev && ecbDays[ecbPrev][c] && ecbDays[ecbPrev][B]) { const p = cross(ecbDays[ecbPrev][c], ecbDays[ecbPrev][B]); prevRate = p ? fmt(p.v, p.s) : null; }\n  if (src === 'oer' && oerPrev && oerPrev.rates && oerPer(oerPrev, c) && oerPer(oerPrev, B)) { const p = cross(oerPer(oerPrev, c), oerPer(oerPrev, B)); prevRate = p ? fmt(p.v, p.s) : null; }\n  if (prevRate && config.maxDailyChangePct > 0) {\n    const ch = pctChange(prevRate, entry.rateFixed);\n    entry.dayChangePct = Math.round(ch * 1000) / 1000;\n    if (ch > config.maxDailyChangePct) held[c] = `rate_change_guard:${entry.dayChangePct}%`;\n  }\n  // cross-source guard\n  if (config.crossSourceTolerancePct > 0 && ecbHas(c) && oerHas(c)) {\n    const other = src === 'ecb' ? cross(oerPer(oer, c), oerPer(oer, B)) : cross(ecbDays[ecbLatest][c], ecbDays[ecbLatest][B]);\n    if (other) {\n      const d = pctChange(fmt(other.v, other.s), entry.rateFixed);\n      entry.crossSourceDiffPct = Math.round(d * 1000) / 1000;\n      if (d > config.crossSourceTolerancePct) held[c] = `cross_source_mismatch:${entry.crossSourceDiffPct}%`;\n    }\n  }\n  spot[c] = entry;\n}\n// historical (close-date) rates: ECB only\nconst historyBase = ecbDates.filter((d) => ecbDays[d][B] !== undefined);\nconst abortReason = ctx.problems.length ? ctx.problems[0] : !Object.keys(spot).length && !ecbFresh && !oerFresh ? 'no_fresh_rates' : null;\nconst summary = { base: B, ecbLatest, ecbFresh, oerDate: oer ? oer.date : null, oerFresh, currencies: Object.keys(spot).length,\n  bySource: Object.values(spot).reduce((m, e) => { m[e.source] = (m[e.source] || 0) + 1; return m; }, {}), held, warnings: warnings.map(redactString) };\nreturn [{ json: { run, config, usable: !abortReason, abortReason, spot, held, ecbDays: historyBase.length ? Object.fromEntries(historyBase.map((d) => [d, ecbDays[d]])) : {},\n  ecbEarliest: historyBase[0] || null, rateSummary: summary } }];\n"
+      },
+      "id": "bc512afc-ebb8-5ead-a0e4-ce453cc42074",
+      "name": "Normalize, Validate & Cache Rates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        300
+      ],
+      "notes": "Source per currency · stale / jump / cross-source guards · static-data cache."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "40669e44-ab07-518d-9f04-81c2be2009cc",
+              "leftValue": "={{ $json.usable }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d92418f4-2de9-55be-a08c-25eb923e1404",
+      "name": "Rates Usable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Search Open International Deals       Mode: Run Once for All Items\n// POST /crm/v3/objects/deals/search, 200 per page, sorted by hs_object_id.\n// Filter groups (OR):\n//   1. open deals                    hs_is_closed = false\n//   2. recently closed-won deals     hs_is_closed_won = true AND closedate ≥ today − CLOSED_WON_LOOKBACK_DAYS\n// (+ pipeline IN HUBSPOT_PIPELINE_IDS when set). HubSpot search stops at\n// 10,000 results per query, so paging restarts with hs_object_id > last id\n// (keyset pagination) to read any number of deals. ~4 requests/second.\n// Sandbox: the fictional deals pinned on the trigger.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst isPlaceholder = (v) => /^YOUR_[A-Z0-9_]*$/i.test(String(v || '').trim());\nconst real = (key, fallback = '') => { const v = env(key, ''); return v === '' || isPlaceholder(v) ? fallback : v; };\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'OER_APP_ID', 'SLACK_WEBHOOK_URL'].map((k) => env(k, '')).filter((v) => v.length >= 8 && !isPlaceholder(v));\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|app[-_]?id|cookie|signature|webhook[-_]?url|credential)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/Token\\s+[A-Za-z0-9]{16,}/g, 'Token [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:app_id|api_key|apikey|key|token|access_key)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 200).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') { const out = {}; for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1); return out; }\n  return value;\n};\n// ── Exact decimal arithmetic (BigInt) · no floating-point drift ──\nconst RATE_SCALE = 12;                          // internal precision for rates\nconst P10 = (n) => 10n ** BigInt(n);\nconst MINOR_UNITS = { JPY: 0, KRW: 0, VND: 0, CLP: 0, ISK: 0, PYG: 0, UGX: 0, XOF: 0, XAF: 0, XPF: 0, KMF: 0, RWF: 0, VUV: 0, GNF: 0, DJF: 0, BIF: 0,\n  BHD: 3, KWD: 3, OMR: 3, JOD: 3, TND: 3, LYD: 3, IQD: 3, CLF: 4, UYW: 4 };\nconst minorUnits = (cur) => (MINOR_UNITS[cur] === undefined ? 2 : MINOR_UNITS[cur]);\nconst isIso = (c) => /^[A-Z]{3}$/.test(String(c || ''));\n// \"1234.5678\" → { v: 12345678n, s: 4 }  (rejects exponents, thousands separators, garbage)\nconst parseDec = (input) => {\n  let str = typeof input === 'number' ? (!Number.isFinite(input) ? '' : /e/i.test(String(input)) ? input.toFixed(12) : String(input)) : String(input ?? '').trim();\n  if (!/^-?\\d+(\\.\\d+)?$/.test(str)) return null;\n  const neg = str.startsWith('-'); if (neg) str = str.slice(1);\n  const [i, f = ''] = str.split('.');\n  const frac = f.slice(0, 18);\n  const v = BigInt(i + frac) * (neg ? -1n : 1n);\n  return { v, s: frac.length };\n};\n// rounding a BigInt division num/den (den > 0) with mode half_up | half_even | down\nconst divRound = (num, den, mode) => {\n  const neg = num < 0n; const n = neg ? -num : num;\n  let q = n / den; const r = n % den;\n  if (mode !== 'down') {\n    const twice = r * 2n;\n    if (twice > den || (twice === den && (mode === 'half_up' || (mode === 'half_even' && q % 2n === 1n)))) q += 1n;\n  }\n  return neg ? -q : q;\n};\nconst rescale = (d, s, mode) => (s >= d.s ? d.v * P10(s - d.s) : divRound(d.v, P10(d.s - s), mode));\nconst fmt = (v, s) => { const neg = v < 0n; let t = (neg ? -v : v).toString().padStart(s + 1, '0'); const out = s ? `${t.slice(0, -s)}.${t.slice(-s)}` : t; return (neg ? '-' : '') + out; };\nconst trimZeros = (str) => (str.includes('.') ? str.replace(/0+$/, '').replace(/\\.$/, '') : str);\n// cross rate: 1 unit of FROM = (anchorPerTo / anchorPerFrom) units of TO, rounded to `decimals`\nconst crossRate = (perFrom, perTo, decimals, mode) => {\n  const a = parseDec(perFrom); const b = parseDec(perTo);\n  if (!a || !b || a.v <= 0n || b.v <= 0n) return null;\n  // (b / a) at `decimals`\n  return { v: divRound(b.v * P10(a.s) * P10(decimals), a.v * P10(b.s), mode), s: decimals };\n};\nconst multiply = (amount, rate, decimals, mode) => ({ v: divRound(amount.v * rate.v, P10(amount.s + rate.s - decimals), mode), s: decimals });\nconst pctChange = (oldStr, newStr) => { const o = Number(oldStr); const n = Number(newStr); return o > 0 ? Math.abs(n - o) / o * 100 : 0; };\n// ── ECB XML (eurofxref-daily / -hist-90d): <Cube time=\"YYYY-MM-DD\"><Cube currency=\"USD\" rate=\"1.0573\"/>… ──\nconst parseEcbXml = (xml) => {\n  const days = {};\n  const re = /<Cube\\s+time=['\"](\\d{4}-\\d{2}-\\d{2})['\"]\\s*>([\\s\\S]*?)<\\/Cube>/g; let m;\n  while ((m = re.exec(String(xml || '')))) {\n    const rates = { EUR: '1' }; const rr = /<Cube\\s+currency=['\"]([A-Z]{3})['\"]\\s+rate=['\"]([0-9.]+)['\"]\\s*\\/>/g; let x;\n    while ((x = rr.exec(m[2]))) rates[x[1]] = x[2];\n    if (Object.keys(rates).length > 1) days[m[1]] = rates;\n  }\n  return days; // { \"2026-11-16\": { EUR: \"1\", USD: \"1.0573\", … } } — anchor EUR\n};\n// latest available date ≤ target (weekends, TARGET holidays)\nconst dateOnOrBefore = (days, target) => Object.keys(days).filter((d) => d <= target).sort().pop() || null;\n\nconst helpers = this.helpers;\nconst rates = $input.first().json;\nconst { run, config } = rates;\nconst ctx = $('Build Run Context').first().json;\nconst P = config.prefix;\nconst PROPS = ['amount', 'deal_currency_code', 'hs_is_closed', 'hs_is_closed_won', 'closedate', 'pipeline', 'hs_lastmodifieddate',\n  `${P}amount_base`, `${P}base_currency`, `${P}rate_used`, `${P}rate_date`, `${P}rate_basis`, `${P}rate_source`, `${P}source_amount`, `${P}source_currency`, `${P}lock`];\nconst since = new Date(Date.parse(config.today + 'T00:00:00Z') - config.closedLookbackDays * 86400000).toISOString();\nconst pipe = config.pipelines.length ? [{ propertyName: 'pipeline', operator: 'IN', values: config.pipelines }] : [];\nconst groups = (afterId) => {\n  const key = afterId ? [{ propertyName: 'hs_object_id', operator: 'GT', value: String(afterId) }] : [];\n  const g = [{ filters: [{ propertyName: 'hs_is_closed', operator: 'EQ', value: 'false' }, ...pipe, ...key] }];\n  if (config.closedLookbackDays > 0 && config.closedPolicy !== 'skip')\n    g.push({ filters: [{ propertyName: 'hs_is_closed_won', operator: 'EQ', value: 'true' }, { propertyName: 'closedate', operator: 'GTE', value: since }, ...pipe, ...key] });\n  return g;\n};\nconst stats = { mode: run.sandboxMode ? 'sandbox' : 'live', pages: 0, requests: 0, deals: 0, truncated: false, error: null };\nlet deals = [];\nif (run.sandboxMode) {\n  const all = ((ctx.fixtures || {}).deals || []);\n  const inPipe = (d) => !config.pipelines.length || config.pipelines.includes(String(d.properties.pipeline));\n  deals = all.filter((d) => inPipe(d) && (String(d.properties.hs_is_closed) === 'false'\n    || (config.closedLookbackDays > 0 && config.closedPolicy !== 'skip' && String(d.properties.hs_is_closed_won) === 'true' && String(d.properties.closedate || '') >= since)));\n  stats.pages = 1;\n} else {\n  const TOKEN = real('HUBSPOT_ACCESS_TOKEN', '');\n  const BASE = env('HUBSPOT_API_BASE_URL', 'https://api.hubapi.com').replace(/\\/+$/, '');\n  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n  if (!TOKEN) stats.error = 'hubspot_token_not_configured';\n  else if (!helpers || typeof helpers.httpRequest !== 'function') stats.error = 'http_helper_unavailable';\n  else {\n    let afterId = null; let after; let inWindow = 0;\n    outer: while (deals.length < config.maxDeals) {\n      let res; let tries = 0;\n      do {\n        stats.requests++;\n        try {\n          res = await helpers.httpRequest({ method: 'POST', url: `${BASE}/crm/v3/objects/deals/search`, json: true, returnFullResponse: true, ignoreHttpStatusErrors: true, timeout: 30000,\n            headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },\n            body: { filterGroups: groups(afterId), sorts: [{ propertyName: 'hs_object_id', direction: 'ASCENDING' }], properties: PROPS, limit: 200, ...(after ? { after } : {}) } });\n        } catch (e) { res = { statusCode: 0, body: { message: e.code || 'network_error' } }; }\n        if (res.statusCode === 429 || res.statusCode >= 500 || res.statusCode === 0) { await sleep(Math.min(10000, 1000 * 2 ** tries)); }\n        else break;\n      } while (++tries < 4);\n      if (res.statusCode !== 200) { stats.error = `search_http_${res.statusCode}${res.body && res.body.category ? ':' + res.body.category : ''}`; break; }\n      stats.pages++;\n      const results = (res.body || {}).results || [];\n      for (const r of results) { deals.push({ id: String(r.id), properties: r.properties || {} }); if (deals.length >= config.maxDeals) { stats.truncated = true; break outer; } }\n      inWindow += results.length;\n      const next = (((res.body || {}).paging || {}).next || {}).after;\n      if (!next || !results.length) break;\n      if (inWindow + 200 > 9800) { afterId = deals[deals.length - 1].id; after = undefined; inWindow = 0; } else after = next;\n      await sleep(250);\n    }\n  }\n}\nconst seen = new Set(); deals = deals.filter((d) => (seen.has(d.id) ? false : seen.add(d.id)));\nstats.deals = deals.length;\nif (stats.error) stats.error = redactString(stats.error);\nreturn [{ json: { ...rates, deals, searchStats: stats } }];\n"
+      },
+      "id": "a0dc77e9-2020-57ef-bdf9-196471e2bd97",
+      "name": "Search Open International Deals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        220
+      ],
+      "notes": "Open + recently closed-won deals · 200/page · keyset paging past 10,000."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Convert Deal Amounts                  Mode: Run Once for All Items\n// For each deal: amount (deal currency) × rate (deal currency → base) →\n// <prefix>amount_base, rounded to the base currency's minor units with\n// ROUNDING_MODE. Exact BigInt decimal math; the stored rate is the one used,\n// so  amount × <prefix>rate_used  reproduces <prefix>amount_base exactly.\n// Basis: open deals → spot (newest rate) · closed-won → ECB rate of the\n//        close date (or the last working day before it), then frozen.\n// Skips (no write): locked, missing/invalid amount or currency, negative,\n//        held currency, no rate, closed deal already frozen, unchanged.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst isPlaceholder = (v) => /^YOUR_[A-Z0-9_]*$/i.test(String(v || '').trim());\nconst real = (key, fallback = '') => { const v = env(key, ''); return v === '' || isPlaceholder(v) ? fallback : v; };\n// ── Exact decimal arithmetic (BigInt) · no floating-point drift ──\nconst RATE_SCALE = 12;                          // internal precision for rates\nconst P10 = (n) => 10n ** BigInt(n);\nconst MINOR_UNITS = { JPY: 0, KRW: 0, VND: 0, CLP: 0, ISK: 0, PYG: 0, UGX: 0, XOF: 0, XAF: 0, XPF: 0, KMF: 0, RWF: 0, VUV: 0, GNF: 0, DJF: 0, BIF: 0,\n  BHD: 3, KWD: 3, OMR: 3, JOD: 3, TND: 3, LYD: 3, IQD: 3, CLF: 4, UYW: 4 };\nconst minorUnits = (cur) => (MINOR_UNITS[cur] === undefined ? 2 : MINOR_UNITS[cur]);\nconst isIso = (c) => /^[A-Z]{3}$/.test(String(c || ''));\n// \"1234.5678\" → { v: 12345678n, s: 4 }  (rejects exponents, thousands separators, garbage)\nconst parseDec = (input) => {\n  let str = typeof input === 'number' ? (!Number.isFinite(input) ? '' : /e/i.test(String(input)) ? input.toFixed(12) : String(input)) : String(input ?? '').trim();\n  if (!/^-?\\d+(\\.\\d+)?$/.test(str)) return null;\n  const neg = str.startsWith('-'); if (neg) str = str.slice(1);\n  const [i, f = ''] = str.split('.');\n  const frac = f.slice(0, 18);\n  const v = BigInt(i + frac) * (neg ? -1n : 1n);\n  return { v, s: frac.length };\n};\n// rounding a BigInt division num/den (den > 0) with mode half_up | half_even | down\nconst divRound = (num, den, mode) => {\n  const neg = num < 0n; const n = neg ? -num : num;\n  let q = n / den; const r = n % den;\n  if (mode !== 'down') {\n    const twice = r * 2n;\n    if (twice > den || (twice === den && (mode === 'half_up' || (mode === 'half_even' && q % 2n === 1n)))) q += 1n;\n  }\n  return neg ? -q : q;\n};\nconst rescale = (d, s, mode) => (s >= d.s ? d.v * P10(s - d.s) : divRound(d.v, P10(d.s - s), mode));\nconst fmt = (v, s) => { const neg = v < 0n; let t = (neg ? -v : v).toString().padStart(s + 1, '0'); const out = s ? `${t.slice(0, -s)}.${t.slice(-s)}` : t; return (neg ? '-' : '') + out; };\nconst trimZeros = (str) => (str.includes('.') ? str.replace(/0+$/, '').replace(/\\.$/, '') : str);\n// cross rate: 1 unit of FROM = (anchorPerTo / anchorPerFrom) units of TO, rounded to `decimals`\nconst crossRate = (perFrom, perTo, decimals, mode) => {\n  const a = parseDec(perFrom); const b = parseDec(perTo);\n  if (!a || !b || a.v <= 0n || b.v <= 0n) return null;\n  // (b / a) at `decimals`\n  return { v: divRound(b.v * P10(a.s) * P10(decimals), a.v * P10(b.s), mode), s: decimals };\n};\nconst multiply = (amount, rate, decimals, mode) => ({ v: divRound(amount.v * rate.v, P10(amount.s + rate.s - decimals), mode), s: decimals });\nconst pctChange = (oldStr, newStr) => { const o = Number(oldStr); const n = Number(newStr); return o > 0 ? Math.abs(n - o) / o * 100 : 0; };\n// ── ECB XML (eurofxref-daily / -hist-90d): <Cube time=\"YYYY-MM-DD\"><Cube currency=\"USD\" rate=\"1.0573\"/>… ──\nconst parseEcbXml = (xml) => {\n  const days = {};\n  const re = /<Cube\\s+time=['\"](\\d{4}-\\d{2}-\\d{2})['\"]\\s*>([\\s\\S]*?)<\\/Cube>/g; let m;\n  while ((m = re.exec(String(xml || '')))) {\n    const rates = { EUR: '1' }; const rr = /<Cube\\s+currency=['\"]([A-Z]{3})['\"]\\s+rate=['\"]([0-9.]+)['\"]\\s*\\/>/g; let x;\n    while ((x = rr.exec(m[2]))) rates[x[1]] = x[2];\n    if (Object.keys(rates).length > 1) days[m[1]] = rates;\n  }\n  return days; // { \"2026-11-16\": { EUR: \"1\", USD: \"1.0573\", … } } — anchor EUR\n};\n// latest available date ≤ target (weekends, TARGET holidays)\nconst dateOnOrBefore = (days, target) => Object.keys(days).filter((d) => d <= target).sort().pop() || null;\n\nconst j = $input.first().json;\nconst { run, config, spot, held, ecbDays, deals } = j;\nconst P = config.prefix; const B = config.base;\nconst nowIso = new Date().toISOString();\nconst truthy = (v) => ['true', '1', 'yes'].includes(String(v || '').toLowerCase());\nconst results = [];\nconst cross = (perFrom, perTo) => crossRate(perFrom, perTo, config.rateDecimals, config.rounding);\nconst closeRate = (cur, closeDate) => {\n  const d = dateOnOrBefore(ecbDays, closeDate);\n  if (!d || !ecbDays[d][cur] || !ecbDays[d][B]) return null;\n  const r = cross(ecbDays[d][cur], ecbDays[d][B]);\n  return r ? { r, date: d, source: 'ecb' } : null;\n};\nfor (const deal of deals) {\n  const p = deal.properties || {};\n  const out = { dealId: deal.id, action: 'skip', reason: null, currency: null, basis: null };\n  const push = (reason) => { out.reason = reason; results.push(out); };\n  if (truthy(p[`${P}lock`])) { push('locked'); continue; }\n  const cur = String(p.deal_currency_code || config.companyCurrency || '').trim().toUpperCase();\n  out.currency = cur;\n  if (!isIso(cur)) { push('invalid_currency'); continue; }\n  if (p.amount === null || p.amount === undefined || String(p.amount).trim() === '') { push('missing_amount'); continue; }\n  const amt = parseDec(String(p.amount).trim());\n  if (!amt) { push('unparseable_amount'); continue; }\n  if (amt.v < 0n && !config.allowNegative) { push('negative_amount'); continue; }\n  const closedWon = truthy(p.hs_is_closed_won); const closed = truthy(p.hs_is_closed);\n  if (closed && !closedWon) { push('closed_lost'); continue; }\n  const basis = closedWon ? 'close_date' : 'spot';\n  out.basis = basis;\n  if (closedWon && config.closedPolicy === 'skip') { push('closed_policy_skip'); continue; }\n  if (closedWon && p[`${P}rate_basis`] === 'close_date' && p[`${P}amount_base`] && p[`${P}source_amount`] === String(p.amount) && p[`${P}source_currency`] === cur && p[`${P}base_currency`] === B) { push('frozen_at_close'); continue; }\n  if (cur === B && !config.includeBaseCurrencyDeals) { push('base_currency_excluded'); continue; }\n  let rate; let rateDate; let source;\n  if (cur === B) { rate = { v: P10(config.rateDecimals), s: config.rateDecimals }; rateDate = config.today; source = 'identity'; }\n  else if (held[cur]) { push(`held:${held[cur]}`); continue; }\n  else if (basis === 'close_date') {\n    const closeDate = String(p.closedate || '').slice(0, 10);\n    if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(closeDate)) { push('missing_close_date'); continue; }\n    const hr = closeRate(cur, closeDate);\n    if (!hr) { push(j.ecbEarliest && closeDate < j.ecbEarliest ? 'close_date_before_rate_history' : 'no_historical_rate'); continue; }\n    rate = hr.r; rateDate = hr.date; source = hr.source;\n  } else {\n    const e = spot[cur];\n    if (!e) { push('no_rate_for_currency'); continue; }\n    rate = parseDec(e.rateFixed); rateDate = e.date; source = e.source;\n  }\n  const baseAmt = multiply(amt, rate, config.baseDecimals, config.rounding);\n  const baseStr = fmt(baseAmt.v, baseAmt.s);\n  const rateStr = trimZeros(fmt(rate.v, rate.s));\n  const props = { [`${P}amount_base`]: baseStr, [`${P}base_currency`]: B, [`${P}rate_used`]: rateStr, [`${P}rate_date`]: rateDate, [`${P}rate_source`]: source,\n    [`${P}rate_basis`]: basis, [`${P}source_amount`]: String(p.amount).trim(), [`${P}source_currency`]: cur, [`${P}synced_at`]: nowIso };\n  // unchanged? (same inputs, same rounded result) → no write, avoids daily property-history noise\n  const prevBase = parseDec(p[`${P}amount_base`]);\n  const same = prevBase && rescale(prevBase, config.baseDecimals, config.rounding) === baseAmt.v && p[`${P}source_amount`] === props[`${P}source_amount`]\n    && p[`${P}source_currency`] === cur && p[`${P}base_currency`] === B && p[`${P}rate_basis`] === basis;\n  Object.assign(out, { amount: props[`${P}source_amount`], amountBase: baseStr, rate: rateStr, rateDate, source,\n    previousBase: p[`${P}amount_base`] || null, changePct: prevBase && Number(p[`${P}amount_base`]) ? Math.round(pctChange(p[`${P}amount_base`], baseStr) * 1000) / 1000 : null });\n  if (same) { push('unchanged'); continue; }\n  out.action = 'update'; out.properties = props; results.push(out);\n}\nlet updates = results.filter((r) => r.action === 'update');\nif (updates.length > config.maxUpdates) { for (const r of updates.slice(config.maxUpdates)) { r.action = 'skip'; r.reason = 'max_updates_per_run'; delete r.properties; } updates = updates.slice(0, config.maxUpdates); }\nconst tally = (f) => results.reduce((m, r) => { const k = f(r); m[k] = (m[k] || 0) + 1; return m; }, {});\nconst totals = {};\nfor (const r of updates) totals[r.currency] = { deals: ((totals[r.currency] || {}).deals || 0) + 1 };\nreturn [{ json: { run, config, rateSummary: j.rateSummary, searchStats: j.searchStats, results,\n  conversion: { deals: results.length, updates: updates.length, byReason: tally((r) => (r.action === 'update' ? 'update' : r.reason.split(':')[0])), byCurrency: tally((r) => r.currency || 'none'),\n    byBasis: tally((r) => r.basis || 'none') } } }];\n"
+      },
+      "id": "62280ea1-0c0b-5400-b570-e11424168c35",
+      "name": "Convert Deal Amounts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        220
+      ],
+      "notes": "Exact decimal math · spot or close-date basis · skips with reasons · unchanged = no write."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Batch Update Payloads           Mode: Run Once for All Items\n// Groups the updates into POST /crm/v3/objects/deals/batch/update bodies of\n// up to 100 deals. One item per batch; the next node sends them one by one.\n// Sandbox / dry run / nothing to update → one item for the simulator.\n// ─────────────────────────────────────────────────────────────────────\nconst j = $input.first().json;\nconst updates = j.results.filter((r) => r.action === 'update');\nconst live = !j.run.sandboxMode && !j.run.dryRun;\nif (!live || !updates.length) return [{ json: { live: false, batchCount: Math.ceil(updates.length / 100), updates: updates.length, run: j.run } }];\nconst batches = [];\nfor (let i = 0; i < updates.length; i += 100) batches.push(updates.slice(i, i + 100));\nreturn batches.map((b, i) => ({ json: { live: true, batchIndex: i, run: j.run, body: { inputs: b.map((u) => ({ id: u.dealId, properties: u.properties })) } } }));\n"
+      },
+      "id": "5def7878-bb9c-56a9-b9a4-9c672f4cd72c",
+      "name": "Build Batch Update Payloads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "f08e7833-bf18-5dc3-abb8-8cab9e805d3b",
+              "leftValue": "={{ $json.live }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "64595fec-b9ad-5faa-af8f-a27fdee222d2",
+      "name": "Live Write?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2640,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ ($env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com').replace(/\\/+$/, '') }}/crm/v3/objects/deals/batch/update",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          },
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 400
+            }
+          }
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}"
+      },
+      "id": "5a444725-49fb-504b-92fb-f1fa55d4b991",
+      "name": "HubSpot Batch Update Deals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2880,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "≤100 deals per call · one call every 400 ms · 429/5xx retried 3×."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Batch Update (Sandbox / Dry Run)   Mode: Run Once for All Items\n// Nothing is written. Reports what the batch update would have sent.\n// ─────────────────────────────────────────────────────────────────────\nconst j = $input.first().json;\nreturn [{ json: { simulated: true, batches: j.batchCount || 0, updates: j.updates || 0 } }];\n"
+      },
+      "id": "07cba2bb-e6fc-59fe-a2d4-91f37b44e8a3",
+      "name": "Simulate Batch Update (Sandbox / Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Audit Log                   Mode: Run Once for All Items\n// One record per run: rate summary (sources, dates, held currencies),\n// search stats, per-deal outcome (deal ID, currency, basis, rate, rate date,\n// old → new base amount, skip reason) and the write results. No deal names,\n// no contacts, no tokens. stdout + static-data ring buffer (not in sandbox).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst isPlaceholder = (v) => /^YOUR_[A-Z0-9_]*$/i.test(String(v || '').trim());\nconst real = (key, fallback = '') => { const v = env(key, ''); return v === '' || isPlaceholder(v) ? fallback : v; };\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'OER_APP_ID', 'SLACK_WEBHOOK_URL'].map((k) => env(k, '')).filter((v) => v.length >= 8 && !isPlaceholder(v));\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|app[-_]?id|cookie|signature|webhook[-_]?url|credential)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/Token\\s+[A-Za-z0-9]{16,}/g, 'Token [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:app_id|api_key|apikey|key|token|access_key)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 200).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') { const out = {}; for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1); return out; }\n  return value;\n};\n\nconst tryAll = (n) => { try { return $(n).all().map((i) => i.json); } catch (e) { return null; } };\nconst ctx = $('Build Run Context').first().json;\nconst rates = (tryAll('Normalize, Validate & Cache Rates') || [])[0] || null;\nconst conv = (tryAll('Convert Deal Amounts') || [])[0] || null;\nconst responses = $input.all().map((i) => i.json);\nconst sim = responses.find((r) => r.simulated);\nlet written = 0; let failed = 0; const errors = [];\nif (!sim && conv) {\n  const batches = tryAll('Build Batch Update Payloads') || [];\n  responses.forEach((r, i) => {\n    const sent = ((batches[i] || {}).body || {}).inputs || [];\n    const code = Number(r.statusCode || (r.error ? 0 : 200));\n    const ok = new Set((((r.body || r) || {}).results || []).map((x) => String(x.id)));\n    if (code === 200) written += sent.length;\n    else if (code === 207) { written += sent.filter((s) => ok.has(String(s.id))).length; failed += sent.filter((s) => !ok.has(String(s.id))).length; errors.push('http_207_partial'); }\n    else { failed += sent.length; errors.push(`http_${code}${r.body && r.body.category ? ':' + r.body.category : ''}${r.error ? ':' + (r.error.message || r.error) : ''}`); }\n  });\n}\nconst run = ctx.run;\nconst audit = {\n  record: 'fx_sync_run', at: new Date().toISOString(), runId: run.runId, mode: run.mode,\n  outcome: !rates ? 'no_rates' : rates.abortReason ? `aborted:${rates.abortReason}` : failed ? 'completed_with_errors' : 'completed',\n  config: { base: ctx.config.base, rateSource: ctx.config.sourcePolicy, rounding: ctx.config.rounding, baseDecimals: ctx.config.baseDecimals, closedPolicy: ctx.config.closedPolicy },\n  rates: rates ? rates.rateSummary : null,\n  search: conv ? conv.searchStats : null,\n  conversion: conv ? conv.conversion : null,\n  writes: sim ? { simulated: true, batches: sim.batches, wouldUpdate: sim.updates } : { simulated: false, written, failed, errors: [...new Set(errors)].slice(0, 10) },\n  deals: conv ? conv.results.map((r) => ({ id: r.dealId, currency: r.currency, basis: r.basis, action: r.action, reason: r.reason, rate: r.rate || null, rateDate: r.rateDate || null,\n    source: r.source || null, from: r.previousBase || null, to: r.amountBase || null, changePct: r.changePct === undefined ? null : r.changePct })) : [],\n};\nconst safe = redact(audit);\nif (flag('AUDIT_LOG_TO_STDOUT', true)) { try { console.log(`[fx-sync:audit] ${JSON.stringify(safe)}`); } catch (e) { /* best effort */ } }\nif (!run.sandboxMode) {\n  try { const sd = $getWorkflowStaticData('global'); const size = Math.max(0, Math.min(500, num('AUDIT_RING_BUFFER_SIZE', 60)));\n    const compact = { ...safe, deals: safe.deals.filter((d) => d.action === 'update' || !['unchanged', 'frozen_at_close'].includes(d.reason)).slice(0, 300) };\n    sd.fxSyncAudit = [...(sd.fxSyncAudit || []), compact].slice(-size); } catch (e) { /* static data unavailable in manual runs */ }\n}\nreturn [{ json: { audit: safe } }];\n"
+      },
+      "id": "86e4cff8-984f-5783-98ad-8c657e96e190",
+      "name": "Sanitized Audit Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        300
+      ],
+      "notes": "Deal IDs, currencies, rates, before → after · no names, no tokens."
+    },
+    {
+      "parameters": {},
+      "id": "9a273953-9a71-5cca-bd44-a195e6c32f2d",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        700
+      ],
+      "notes": "Fires when this workflow is selected as its own Error Workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Error Handler              Mode: Run Once for All Items\n// Fed by the Error Trigger when this workflow is its own Error Workflow.\n// Drops stack traces and request options, redacts secrets, and emits a\n// safe alert record (and optionally a minimal Slack notice).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst isPlaceholder = (v) => /^YOUR_[A-Z0-9_]*$/i.test(String(v || '').trim());\nconst real = (key, fallback = '') => { const v = env(key, ''); return v === '' || isPlaceholder(v) ? fallback : v; };\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'OER_APP_ID', 'SLACK_WEBHOOK_URL'].map((k) => env(k, '')).filter((v) => v.length >= 8 && !isPlaceholder(v));\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|app[-_]?id|cookie|signature|webhook[-_]?url|credential)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/Token\\s+[A-Za-z0-9]{16,}/g, 'Token [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:app_id|api_key|apikey|key|token|access_key)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 200).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') { const out = {}; for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1); return out; }\n  return value;\n};\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\n\nreturn $input.all().map(({ json }) => {\n  const execution = json.execution || {};\n  const error = execution.error || (json.trigger && json.trigger.error) || {};\n  const alert = {\n    alertType: 'fx_sync_execution_error',\n    at: new Date().toISOString(),\n    workflow: { id: json.workflow ? json.workflow.id : null, name: redactString(json.workflow ? json.workflow.name : '') },\n    execution: { id: execution.id || null, mode: execution.mode || null, retryOf: execution.retryOf || null },\n    lastNodeExecuted: execution.lastNodeExecuted || null,\n    errorName: redactString(error.name || 'Error'),\n    errorMessage: redactString(error.message || 'unknown error').slice(0, 300),\n    nextStep: 'Open the execution in n8n (restricted access) and check the node named in lastNodeExecuted.',\n  };\n  try { console.error(`[fx-sync:error] ${JSON.stringify(alert)}`); } catch (e) { /* best effort */ }\n  const notify = !SANDBOX_MODE && !DRY_RUN && env('SLACK_WEBHOOK_URL', '') !== '' && flag('SLACK_NOTIFY_ON_MONITOR_ERROR', true);\n  return {\n    json: {\n      ...alert,\n      notify,\n      slackMessage: {\n        text: `Currency sync failed at ${alert.lastNodeExecuted || 'unknown node'}`,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: '⚠️ Currency sync failed', emoji: true } },\n          { type: 'section', text: { type: 'mrkdwn', text: `*Node:* ${alert.lastNodeExecuted || 'unknown'}\\n*Error:* ${alert.errorName}: ${alert.errorMessage}` } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: `Execution \\`${alert.execution.id || 'n/a'}\\` · no partial batch is retried automatically; the next daily run recalculates everything` }] },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "03ba2e4a-4f8d-5355-8fe8-cbd5c17d54cd",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "eb3db42c-bd90-5d65-a6c5-ff4bd25244e3",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "88b21fe5-1591-58e5-8ed2-992fcf1dd8c1",
+      "name": "Notify Execution Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "e87ab421-e674-59f9-8b64-1b0bcb4c3646",
+      "name": "Post Execution Error Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        640
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## n8n-multi-currency-exchange-rate-hubspot-sync\nECB / Open Exchange Rates → validated rate table → HubSpot deals (open + recently closed-won) → exact conversion to the base currency → batch update of fx_ properties → audit. DH Robin · dhRobin Systems.\n\n**Safe defaults:** `SANDBOX_MODE=true`, `DRY_RUN=true`. Sandbox makes no outside calls; dry run reads rates and deals but writes nothing.\n\n**Stage 1** Execute the trigger with its pinned fictional rates and deals.\n**Stage 2** `SANDBOX_MODE=false`: real rates + staging HubSpot portal, writes simulated.\n**Stage 3** `DRY_RUN=false`: fx_ properties are written.",
+        "height": 300,
+        "width": 760,
+        "color": 4
+      },
+      "id": "3d252a6d-692b-50a7-be6f-69bdf0fb91b1",
+      "name": "Sticky: Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Rate guards\nStale rates, a day-over-day jump above MAX_DAILY_RATE_CHANGE_PCT or an ECB vs OER disagreement hold that currency: its deals are left untouched and listed in the audit.",
+        "height": 120,
+        "width": 560,
+        "color": 3
+      },
+      "id": "23dbe423-0a9b-57f5-b7a0-6fdf7b9851e2",
+      "name": "Sticky: Guards",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1400,
+        520
+      ]
+    }
+  ],
+  "connections": {
+    "Daily Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Run Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Run Context": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Rates?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Rates?": {
+      "main": [
+        [
+          {
+            "node": "Load Rate Fixtures (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch ECB Reference Rates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Rate Fixtures (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Normalize, Validate & Cache Rates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch ECB Reference Rates": {
+      "main": [
+        [
+          {
+            "node": "OER Configured?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OER Configured?": {
+      "main": [
+        [
+          {
+            "node": "Fetch Open Exchange Rates",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize, Validate & Cache Rates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Open Exchange Rates": {
+      "main": [
+        [
+          {
+            "node": "Normalize, Validate & Cache Rates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize, Validate & Cache Rates": {
+      "main": [
+        [
+          {
+            "node": "Rates Usable?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rates Usable?": {
+      "main": [
+        [
+          {
+            "node": "Search Open International Deals",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitized Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Open International Deals": {
+      "main": [
+        [
+          {
+            "node": "Convert Deal Amounts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert Deal Amounts": {
+      "main": [
+        [
+          {
+            "node": "Build Batch Update Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Batch Update Payloads": {
+      "main": [
+        [
+          {
+            "node": "Live Write?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live Write?": {
+      "main": [
+        [
+          {
+            "node": "HubSpot Batch Update Deals",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Batch Update (Sandbox / Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot Batch Update Deals": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Batch Update (Sandbox / Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Notify Execution Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Execution Error?": {
+      "main": [
+        [
+          {
+            "node": "Post Execution Error Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "Daily Schedule Trigger": [
+      {
+        "json": {
+          "timestamp": "2026-11-16T17:15:00.000+00:00",
+          "Readable date": "November 16th 2026, 5:15:00 pm",
+          "Timezone": "UTC (UTC+00:00)",
+          "sandboxFixtures": {
+            "today": "2026-11-16",
+            "ecbXml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><gesmes:Envelope xmlns:gesmes=\"http://www.gesmes.org/xml/2002-08-01\" xmlns=\"http://www.ecb.int/vocabulary/2002-08-01/eurofxref\"><gesmes:subject>Reference rates</gesmes:subject><gesmes:Sender><gesmes:name>SANDBOX FIXTURE (fictional values)</gesmes:name></gesmes:Sender><Cube><Cube time=\"2026-11-16\"><Cube currency=\"USD\" rate=\"1.0573\"/><Cube currency=\"JPY\" rate=\"163.21\"/><Cube currency=\"GBP\" rate=\"0.83455\"/><Cube currency=\"CHF\" rate=\"0.93820\"/><Cube currency=\"HUF\" rate=\"404.15\"/><Cube currency=\"TRY\" rate=\"41.250\"/><Cube currency=\"SEK\" rate=\"11.4925\"/><Cube currency=\"PLN\" rate=\"4.2785\"/><Cube currency=\"INR\" rate=\"89.312\"/></Cube><Cube time=\"2026-11-13\"><Cube currency=\"USD\" rate=\"1.0551\"/><Cube currency=\"JPY\" rate=\"162.88\"/><Cube currency=\"GBP\" rate=\"0.83390\"/><Cube currency=\"CHF\" rate=\"0.93745\"/><Cube currency=\"HUF\" rate=\"403.80\"/><Cube currency=\"TRY\" rate=\"36.410\"/><Cube currency=\"SEK\" rate=\"11.4850\"/><Cube currency=\"PLN\" rate=\"4.2801\"/><Cube currency=\"INR\" rate=\"89.104\"/></Cube><Cube time=\"2026-11-12\"><Cube currency=\"USD\" rate=\"1.0540\"/><Cube currency=\"JPY\" rate=\"162.40\"/><Cube currency=\"GBP\" rate=\"0.83310\"/><Cube currency=\"CHF\" rate=\"0.93700\"/><Cube currency=\"HUF\" rate=\"403.10\"/><Cube currency=\"TRY\" rate=\"36.380\"/><Cube currency=\"SEK\" rate=\"11.4790\"/><Cube currency=\"PLN\" rate=\"4.2820\"/><Cube currency=\"INR\" rate=\"89.010\"/></Cube><Cube time=\"2026-11-11\"><Cube currency=\"USD\" rate=\"1.0528\"/><Cube currency=\"JPY\" rate=\"162.05\"/><Cube currency=\"GBP\" rate=\"0.83275\"/><Cube currency=\"CHF\" rate=\"0.93655\"/><Cube currency=\"HUF\" rate=\"402.70\"/><Cube currency=\"TRY\" rate=\"36.355\"/><Cube currency=\"SEK\" rate=\"11.4705\"/><Cube currency=\"PLN\" rate=\"4.2833\"/><Cube currency=\"INR\" rate=\"88.940\"/></Cube><Cube time=\"2026-11-10\"><Cube currency=\"USD\" rate=\"1.0519\"/><Cube currency=\"JPY\" rate=\"161.90\"/><Cube currency=\"GBP\" rate=\"0.83240\"/><Cube currency=\"CHF\" rate=\"0.93610\"/><Cube currency=\"HUF\" rate=\"402.45\"/><Cube currency=\"TRY\" rate=\"36.330\"/><Cube currency=\"SEK\" rate=\"11.4660\"/><Cube currency=\"PLN\" rate=\"4.2851\"/><Cube currency=\"INR\" rate=\"88.875\"/></Cube><Cube time=\"2026-11-09\"><Cube currency=\"USD\" rate=\"1.0504\"/><Cube currency=\"JPY\" rate=\"161.62\"/><Cube currency=\"GBP\" rate=\"0.83190\"/><Cube currency=\"CHF\" rate=\"0.93580\"/><Cube currency=\"HUF\" rate=\"402.10\"/><Cube currency=\"TRY\" rate=\"36.300\"/><Cube currency=\"SEK\" rate=\"11.4612\"/><Cube currency=\"PLN\" rate=\"4.2870\"/><Cube currency=\"INR\" rate=\"88.790\"/></Cube><Cube time=\"2026-11-06\"><Cube currency=\"USD\" rate=\"1.0492\"/><Cube currency=\"JPY\" rate=\"161.30\"/><Cube currency=\"GBP\" rate=\"0.83150\"/><Cube currency=\"CHF\" rate=\"0.93530\"/><Cube currency=\"HUF\" rate=\"401.85\"/><Cube currency=\"TRY\" rate=\"36.270\"/><Cube currency=\"SEK\" rate=\"11.4580\"/><Cube currency=\"PLN\" rate=\"4.2890\"/><Cube currency=\"INR\" rate=\"88.705\"/></Cube></Cube></gesmes:Envelope>",
+            "oerLatest": {
+              "disclaimer": "Sandbox fixture, fictional values",
+              "license": "fixture",
+              "timestamp": 1794844800,
+              "base": "USD",
+              "rates": {
+                "USD": 1,
+                "EUR": 0.945805,
+                "GBP": 0.789322,
+                "JPY": 154.365,
+                "CHF": 0.887355,
+                "ARS": 1012.5,
+                "KWD": 0.30712,
+                "AED": 3.6725,
+                "TRY": 39.0145,
+                "INR": 84.472
+              }
+            },
+            "oerPrevious": {
+              "anchor": "USD",
+              "date": "2026-11-13",
+              "rates": {
+                "USD": "1",
+                "EUR": "0.947778",
+                "ARS": "1005.25",
+                "KWD": "0.30698",
+                "AED": "3.6725"
+              }
+            },
+            "deals": [
+              {
+                "id": "4100001",
+                "properties": {
+                  "amount": "48500",
+                  "deal_currency_code": "EUR",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100001"
+                }
+              },
+              {
+                "id": "4100002",
+                "properties": {
+                  "amount": "12999.99",
+                  "deal_currency_code": "GBP",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100002"
+                }
+              },
+              {
+                "id": "4100003",
+                "properties": {
+                  "amount": "5400000",
+                  "deal_currency_code": "JPY",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100003"
+                }
+              },
+              {
+                "id": "4100004",
+                "properties": {
+                  "amount": "20000",
+                  "deal_currency_code": "USD",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100004"
+                }
+              },
+              {
+                "id": "4100005",
+                "properties": {
+                  "amount": "7500",
+                  "deal_currency_code": null,
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100005"
+                }
+              },
+              {
+                "id": "4100006",
+                "properties": {
+                  "amount": "31000",
+                  "deal_currency_code": "CHF",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100006",
+                  "fx_amount_base": "34936.47",
+                  "fx_base_currency": "USD",
+                  "fx_rate_used": "1.1270052400",
+                  "fx_rate_date": "2026-11-13",
+                  "fx_rate_source": "ecb",
+                  "fx_rate_basis": "spot",
+                  "fx_source_amount": "31000",
+                  "fx_source_currency": "CHF"
+                }
+              },
+              {
+                "id": "4100007",
+                "properties": {
+                  "amount": "64000",
+                  "deal_currency_code": "EUR",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100007",
+                  "fx_amount_base": "60000.00",
+                  "fx_base_currency": "USD",
+                  "fx_rate_used": "1.0551",
+                  "fx_rate_date": "2026-11-13",
+                  "fx_rate_source": "ecb",
+                  "fx_rate_basis": "spot",
+                  "fx_source_amount": "56866.81",
+                  "fx_source_currency": "EUR"
+                }
+              },
+              {
+                "id": "4100008",
+                "properties": {
+                  "amount": "2500000",
+                  "deal_currency_code": "ARS",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100008"
+                }
+              },
+              {
+                "id": "4100009",
+                "properties": {
+                  "amount": "1500",
+                  "deal_currency_code": "XYZ1",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100009"
+                }
+              },
+              {
+                "id": "4100010",
+                "properties": {
+                  "amount": "",
+                  "deal_currency_code": "AED",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100010"
+                }
+              },
+              {
+                "id": "4100011",
+                "properties": {
+                  "amount": "99000",
+                  "deal_currency_code": "EUR",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100011",
+                  "fx_lock": "true"
+                }
+              },
+              {
+                "id": "4100012",
+                "properties": {
+                  "amount": "18250",
+                  "deal_currency_code": "EUR",
+                  "hs_is_closed": "true",
+                  "hs_is_closed_won": "true",
+                  "closedate": "2026-11-08T15:30:00.000Z",
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100012"
+                }
+              },
+              {
+                "id": "4100013",
+                "properties": {
+                  "amount": "9400",
+                  "deal_currency_code": "GBP",
+                  "hs_is_closed": "true",
+                  "hs_is_closed_won": "true",
+                  "closedate": "2026-11-02T09:00:00.000Z",
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100013",
+                  "fx_amount_base": "11942.76",
+                  "fx_base_currency": "USD",
+                  "fx_rate_used": "1.2705",
+                  "fx_rate_date": "2026-11-02",
+                  "fx_rate_source": "ecb",
+                  "fx_rate_basis": "close_date",
+                  "fx_source_amount": "9400",
+                  "fx_source_currency": "GBP"
+                }
+              },
+              {
+                "id": "4100014",
+                "properties": {
+                  "amount": "-500",
+                  "deal_currency_code": "GBP",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100014"
+                }
+              },
+              {
+                "id": "4100015",
+                "properties": {
+                  "amount": "410000",
+                  "deal_currency_code": "TRY",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100015"
+                }
+              },
+              {
+                "id": "4100016",
+                "properties": {
+                  "amount": "1250.125",
+                  "deal_currency_code": "KWD",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100016"
+                }
+              },
+              {
+                "id": "4100017",
+                "properties": {
+                  "amount": "125000000.50",
+                  "deal_currency_code": "HUF",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100017"
+                }
+              },
+              {
+                "id": "4100018",
+                "properties": {
+                  "amount": "7000",
+                  "deal_currency_code": "SEK",
+                  "hs_is_closed": "true",
+                  "hs_is_closed_won": "true",
+                  "closedate": "2026-10-28T12:00:00.000Z",
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100018"
+                }
+              },
+              {
+                "id": "4100019",
+                "properties": {
+                  "amount": "3300",
+                  "deal_currency_code": "PLN",
+                  "hs_is_closed": "true",
+                  "hs_is_closed_won": "false",
+                  "closedate": "2026-11-10T12:00:00.000Z",
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100019"
+                }
+              },
+              {
+                "id": "4100020",
+                "properties": {
+                  "amount": "880000",
+                  "deal_currency_code": "INR",
+                  "hs_is_closed": "true",
+                  "hs_is_closed_won": "true",
+                  "closedate": "2026-08-01T12:00:00.000Z",
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100020"
+                }
+              },
+              {
+                "id": "4100021",
+                "properties": {
+                  "amount": "1,200",
+                  "deal_currency_code": "EUR",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100021"
+                }
+              },
+              {
+                "id": "4100022",
+                "properties": {
+                  "amount": "10000",
+                  "deal_currency_code": "CHF",
+                  "hs_is_closed": "false",
+                  "hs_is_closed_won": "false",
+                  "closedate": null,
+                  "pipeline": "default",
+                  "hs_lastmodifieddate": "2026-11-15T10:00:00.000Z",
+                  "hs_object_id": "4100022",
+                  "fx_amount_base": "11269.45",
+                  "fx_base_currency": "USD",
+                  "fx_rate_used": "1.1269452142",
+                  "fx_rate_date": "2026-11-13",
+                  "fx_rate_source": "ecb",
+                  "fx_rate_basis": "spot",
+                  "fx_source_amount": "10000",
+                  "fx_source_currency": "CHF"
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "author": "DH Robin, Revenue Infrastructure Architect · dhRobin Systems",
+    "license": "MIT"
+  }
+}
